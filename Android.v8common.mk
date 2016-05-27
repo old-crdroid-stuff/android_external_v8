@@ -5,6 +5,8 @@ endif
 
 LOCAL_CPP_EXTENSION := cc
 
+LOCAL_ARM_MODE := arm
+
 LOCAL_CFLAGS += \
 	-Wno-endif-labels \
 	-Wno-import \
