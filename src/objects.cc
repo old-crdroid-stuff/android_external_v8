@@ -12670,6 +12670,53 @@ void JSFunction::EnsureHasInitialMap(Handle<JSFunction> function) {
   map->StartInobjectSlackTracking();
 }
 
+namespace {
+bool FastInitializeDerivedMap(Isolate* isolate, Handle<JSFunction> new_target,
+                              Handle<JSFunction> constructor,
+                              Handle<Map> constructor_initial_map) {
+  // Check that |function|'s initial map still in sync with the |constructor|,
+  // otherwise we must create a new initial map for |function|.
+  if (new_target->has_initial_map() &&
+      new_target->initial_map()->GetConstructor() == *constructor) {
+    DCHECK(new_target->instance_prototype()->IsJSReceiver());
+    return true;
+  }
+  // Create a new map with the size and number of in-object properties
+  // suggested by |function|.
+
+  // Link initial map and constructor function if the new.target is actually a
+  // subclass constructor.
+  if (!IsDerivedConstructor(new_target->shared()->kind())) return false;
+
+  Handle<Object> prototype(new_target->instance_prototype(), isolate);
+  InstanceType instance_type = constructor_initial_map->instance_type();
+  DCHECK(CanSubclassHaveInobjectProperties(instance_type));
+
+  int internal_fields =
+      JSObject::GetInternalFieldCount(*constructor_initial_map);
+  int pre_allocated = constructor_initial_map->GetInObjectProperties() -
+                      constructor_initial_map->unused_property_fields();
+  int instance_size;
+  int in_object_properties;
+  new_target->CalculateInstanceSizeForDerivedClass(
+      instance_type, internal_fields, &instance_size,
+      &in_object_properties);
+
+  int unused_property_fields = in_object_properties - pre_allocated;
+  Handle<Map> map =
+      Map::CopyInitialMap(constructor_initial_map, instance_size,
+                          in_object_properties, unused_property_fields);
+  map->set_new_target_is_base(false);
+
+  JSFunction::SetInitialMap(new_target, map, prototype);
+  map->SetConstructor(*constructor);
+  map->set_construction_counter(Map::kNoSlackTracking);
+  map->StartInobjectSlackTracking();
+
+  return true;
+}
+
+}  // namespace
 
 // static
 MaybeHandle<Map> JSFunction::GetDerivedMap(Isolate* isolate,
@@ -12688,41 +12735,9 @@ MaybeHandle<Map> JSFunction::GetDerivedMap(Isolate* isolate,
 
     // Check that |function|'s initial map still in sync with the |constructor|,
     // otherwise we must create a new initial map for |function|.
-    if (function->has_initial_map() &&
-        function->initial_map()->GetConstructor() == *constructor) {
+    if (FastInitializeDerivedMap(isolate, function, constructor,
+                                 constructor_initial_map)) {
       return handle(function->initial_map(), isolate);
-    }
-
-    // Create a new map with the size and number of in-object properties
-    // suggested by |function|.
-
-    // Link initial map and constructor function if the new.target is actually a
-    // subclass constructor.
-    if (IsDerivedConstructor(function->shared()->kind())) {
-      Handle<Object> prototype(function->instance_prototype(), isolate);
-      InstanceType instance_type = constructor_initial_map->instance_type();
-      DCHECK(CanSubclassHaveInobjectProperties(instance_type));
-      int internal_fields =
-          JSObject::GetInternalFieldCount(*constructor_initial_map);
-      int pre_allocated = constructor_initial_map->GetInObjectProperties() -
-                          constructor_initial_map->unused_property_fields();
-      int instance_size;
-      int in_object_properties;
-      function->CalculateInstanceSizeForDerivedClass(
-          instance_type, internal_fields, &instance_size,
-          &in_object_properties);
-
-      int unused_property_fields = in_object_properties - pre_allocated;
-      Handle<Map> map =
-          Map::CopyInitialMap(constructor_initial_map, instance_size,
-                              in_object_properties, unused_property_fields);
-      map->set_new_target_is_base(false);
-
-      JSFunction::SetInitialMap(function, map, prototype);
-      map->SetConstructor(*constructor);
-      map->set_construction_counter(Map::kNoSlackTracking);
-      map->StartInobjectSlackTracking();
-      return map;
     }
   }
 
@@ -13153,8 +13168,8 @@ Handle<JSObject> Script::GetWrapper(Handle<Script> script) {
 
 MaybeHandle<SharedFunctionInfo> Script::FindSharedFunctionInfo(
     Isolate* isolate, const FunctionLiteral* fun) {
-  DCHECK_NE(fun->function_literal_id(), FunctionLiteral::kIdTypeInvalid);
-  DCHECK_LT(fun->function_literal_id(), shared_function_infos()->length());
+  CHECK_NE(fun->function_literal_id(), FunctionLiteral::kIdTypeInvalid);
+  CHECK_LT(fun->function_literal_id(), shared_function_infos()->length());
   Object* shared = shared_function_infos()->get(fun->function_literal_id());
   if (shared->IsUndefined(isolate) || WeakCell::cast(shared)->cleared()) {
     return MaybeHandle<SharedFunctionInfo>();
@@ -13371,15 +13386,17 @@ void JSFunction::CalculateInstanceSizeHelper(InstanceType instance_type,
                                              int* instance_size,
                                              int* in_object_properties) {
   int header_size = JSObject::GetHeaderSize(instance_type);
-  DCHECK_LE(requested_internal_fields,
-            (JSObject::kMaxInstanceSize - header_size) >> kPointerSizeLog2);
+  int max_nof_fields =
+      (JSObject::kMaxInstanceSize - header_size) >> kPointerSizeLog2;
+  CHECK_LE(max_nof_fields, JSObject::kMaxInObjectProperties);
+  *in_object_properties = Min(requested_in_object_properties, max_nof_fields);
+  CHECK_LE(requested_internal_fields, max_nof_fields - *in_object_properties);
   *instance_size =
-      Min(header_size +
-              ((requested_internal_fields + requested_in_object_properties)
-               << kPointerSizeLog2),
-          JSObject::kMaxInstanceSize);
-  *in_object_properties = ((*instance_size - header_size) >> kPointerSizeLog2) -
-                          requested_internal_fields;
+      header_size +
+      ((requested_internal_fields + *in_object_properties) << kPointerSizeLog2);
+  CHECK_EQ(*in_object_properties,
+           ((*instance_size - header_size) >> kPointerSizeLog2) -
+               requested_internal_fields);
 }
 
 
@@ -13404,7 +13421,13 @@ void JSFunction::CalculateInstanceSizeForDerivedClass(
     if (!current->IsJSFunction()) break;
     JSFunction* func = JSFunction::cast(current);
     SharedFunctionInfo* shared = func->shared();
-    expected_nof_properties += shared->expected_nof_properties();
+    int count = shared->expected_nof_properties();
+    // Check that the estimate is sane.
+    if (expected_nof_properties <= JSObject::kMaxInObjectProperties - count) {
+      expected_nof_properties += count;
+    } else {
+      expected_nof_properties = JSObject::kMaxInObjectProperties;
+    }
     if (!IsDerivedConstructor(shared->kind())) {
       break;
     }
@@ -17437,6 +17460,120 @@ void AddToLiteralsMap(Handle<CompilationCacheTable> cache, int cache_entry,
   STATIC_ASSERT(kLiteralEntryLength == 2);
   Handle<FixedArray> new_literals_map;
   int entry;
+
+  Object* obj = cache->get(cache_entry);
+
+  if (!obj->IsFixedArray() || FixedArray::cast(obj)->length() == 0) {
+    new_literals_map =
+        isolate->factory()->NewFixedArray(kLiteralInitialLength, TENURED);
+    entry = 0;
+  } else {
+    Handle<FixedArray> old_literals_map(FixedArray::cast(obj), isolate);
+    entry = SearchLiteralsMapEntry(*cache, cache_entry, *native_context);
+    if (entry >= 0) {
+      // Just set the code of the entry.
+      Handle<WeakCell> literals_cell =
+          isolate->factory()->NewWeakCell(literals);
+      old_literals_map->set(entry + kLiteralLiteralsOffset, *literals_cell);
+      return;
+    }
+
+    // Can we reuse an entry?
+    DCHECK(entry < 0);
+    int length = old_literals_map->length();
+    for (int i = 0; i < length; i += kLiteralEntryLength) {
+      if (WeakCell::cast(old_literals_map->get(i + kLiteralContextOffset))
+              ->cleared()) {
+        new_literals_map = old_literals_map;
+        entry = i;
+        break;
+      }
+    }
+
+    if (entry < 0) {
+      // Copy old optimized code map and append one new entry.
+      new_literals_map = isolate->factory()->CopyFixedArrayAndGrow(
+          old_literals_map, kLiteralEntryLength, TENURED);
+      entry = old_literals_map->length();
+    }
+  }
+
+  Handle<WeakCell> literals_cell = isolate->factory()->NewWeakCell(literals);
+  WeakCell* context_cell = native_context->self_weak_cell();
+
+  new_literals_map->set(entry + kLiteralContextOffset, context_cell);
+  new_literals_map->set(entry + kLiteralLiteralsOffset, *literals_cell);
+
+#ifdef DEBUG
+  for (int i = 0; i < new_literals_map->length(); i += kLiteralEntryLength) {
+    WeakCell* cell =
+        WeakCell::cast(new_literals_map->get(i + kLiteralContextOffset));
+    DCHECK(cell->cleared() || cell->value()->IsNativeContext());
+    cell = WeakCell::cast(new_literals_map->get(i + kLiteralLiteralsOffset));
+    DCHECK(cell->cleared() || (cell->value()->IsCell()));
+  }
+#endif
+
+  Object* old_literals_map = cache->get(cache_entry);
+  if (old_literals_map != *new_literals_map) {
+    cache->set(cache_entry, *new_literals_map);
+  }
+}
+
+Cell* SearchLiteralsMap(CompilationCacheTable* cache, int cache_entry,
+                        Context* native_context) {
+  Cell* result = nullptr;
+  int entry = SearchLiteralsMapEntry(cache, cache_entry, native_context);
+  if (entry >= 0) {
+    FixedArray* literals_map = FixedArray::cast(cache->get(cache_entry));
+    DCHECK_LE(entry + kLiteralEntryLength, literals_map->length());
+    WeakCell* cell =
+        WeakCell::cast(literals_map->get(entry + kLiteralLiteralsOffset));
+
+    result = cell->cleared() ? nullptr : Cell::cast(cell->value());
+  }
+  DCHECK(result == nullptr || result->IsCell());
+  return result;
+}
+
+}  // namespace
+
+InfoVectorPair CompilationCacheTable::LookupScript(Handle<String> src,
+                                                   Handle<Context> context,
+                                                   LanguageMode language_mode) {
+  InfoVectorPair empty_result;
+  Handle<SharedFunctionInfo> shared(context->closure()->shared());
+  StringSharedKey key(src, shared, language_mode, kNoSourcePosition);
+  int entry = FindEntry(&key);
+  if (entry == kNotFound) return empty_result;
+  int index = EntryToIndex(entry);
+  if (!get(index)->IsFixedArray()) return empty_result;
+  Object* obj = get(index + 1);
+  if (obj->IsSharedFunctionInfo()) {
+    Cell* literals =
+        SearchLiteralsMap(this, index + 2, context->native_context());
+    return InfoVectorPair(SharedFunctionInfo::cast(obj), literals);
+  }
+  return empty_result;
+}
+
+InfoVectorPair CompilationCacheTable::LookupEval(
+    Handle<String> src, Handle<SharedFunctionInfo> outer_info,
+    Handle<Context> native_context, LanguageMode language_mode, int position) {
+  InfoVectorPair empty_result;
+  StringSharedKey key(src, outer_info, language_mode, position);
+  int entry = FindEntry(&key);
+  if (entry == kNotFound) return empty_result;
+  int index = EntryToIndex(entry);
+  if (!get(index)->IsFixedArray()) return empty_result;
+  Object* obj = get(EntryToIndex(entry) + 1);
+  if (obj->IsSharedFunctionInfo()) {
+    Cell* literals =
+        SearchLiteralsMap(this, EntryToIndex(entry) + 2, *native_context);
+    return InfoVectorPair(SharedFunctionInfo::cast(obj), literals);
+  }
+  return empty_result;
+}
 
   Object* obj = cache->get(cache_entry);
 

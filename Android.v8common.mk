@@ -2,8 +2,6 @@ LOCAL_CXX_STL := libc++
 
 LOCAL_CPP_EXTENSION := cc
 
-LOCAL_ARM_MODE := arm
-
 LOCAL_CFLAGS += \
 	-Wno-endif-labels \
 	-Wno-import \
@@ -12,7 +10,6 @@ LOCAL_CFLAGS += \
 	-Wno-sign-compare \
 	-Wno-missing-field-initializers \
 	-Wno-ignored-qualifiers \
-	-Wno-undefined-var-template \
 	-fno-exceptions \
 	-fvisibility=hidden \
 	-DENABLE_DEBUGGER_SUPPORT \
@@ -26,10 +23,6 @@ LOCAL_CFLAGS += \
 LOCAL_CFLAGS_arm += -DV8_TARGET_ARCH_ARM
 LOCAL_CFLAGS_arm64 += -DV8_TARGET_ARCH_ARM64
 
-# atomicops_internals_arm64_gcc.h:77:49: error:
-# expected compatible register, symbol or integer in range [0, 4095]
-LOCAL_CLANG_CFLAGS_arm64 += -no-integrated-as
-
 LOCAL_CFLAGS_mips += -DV8_TARGET_ARCH_MIPS \
 	-Umips \
 	-finline-limit=64 \
@@ -42,5 +35,3 @@ LOCAL_CFLAGS_mips64 += -DV8_TARGET_ARCH_MIPS64 \
 LOCAL_CFLAGS_x86 += -DV8_TARGET_ARCH_IA32
 LOCAL_CFLAGS_x86_64 += -DV8_TARGET_ARCH_X64
 
-# type-punning to incomplete type in api.cc
-LOCAL_CFLAGS += -fno-strict-aliasing
